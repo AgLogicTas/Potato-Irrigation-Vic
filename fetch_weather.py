@@ -3,26 +3,29 @@
 Fetches a 7-day ETo / rainfall forecast for each Ag Logic potato region from
 Open-Meteo (free, no API key needed) and writes data.json.
 
-This is run automatically by .github/workflows/update-weather.yml on a daily
-schedule. You can also run it yourself locally with: python3 fetch_weather.py
+Run automatically by .github/workflows/update-weather.yml. You can also run it
+yourself with: python3 fetch_weather.py
 
-Reliability notes:
-- Each region is retried a few times (with a growing pause) if Open-Meteo
-  errors out or rate-limits us.
-- There is a short pause between regions so we don't hit the rate limit.
-- If a region still fails after all retries, we keep that region's previous
-  forecast from the existing data.json rather than writing null. (A null
-  region breaks the Power Automate email flow.)
+How it works (changed Nov 2026 after Dean/Newlyn went stale):
+- ALL locations are requested in ONE call to Open-Meteo (instead of one call
+  per location), so there is only one connection that can time out.
+- That call is retried up to 6 times with growing pauses and a long timeout.
+- If the one big call still fails, it falls back to one call per location.
+- If a location still can't be fetched, its previous forecast is kept in
+  data.json (so the Power Automate flow never sees null) BUT the script then
+  exits with an error, so the GitHub run turns RED instead of looking fine.
+  The data.json file is still saved/committed first.
 """
 import json
 import os
+import sys
 import time
-import urllib.request
 import urllib.parse
-from datetime import datetime, timezone, timedelta
+import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-# Real-world coordinates for every location offered on the calculator
-# (Victoria = Ballarat area).
+# Real-world coordinates for every location offered on the calculator.
 REGIONS = [
     {"id": "vic-dean", "name": "Dean", "lat": -37.46667, "lon": 143.98333, "tz": "Australia/Melbourne"},
     {"id": "vic-newlyn", "name": "Newlyn", "lat": -37.41700, "lon": 143.98100, "tz": "Australia/Melbourne"},
@@ -33,61 +36,62 @@ REGIONS = [
     {"id": "vic-dunnstown", "name": "Dunnstown", "lat": -37.60000, "lon": 143.98333, "tz": "Australia/Melbourne"},
     {"id": "vic-bolwarrah", "name": "Bolwarrah", "lat": -37.51667, "lon": 144.10000, "tz": "Australia/Melbourne"},
     {"id": "vic-windermere", "name": "Windermere", "lat": -37.51167, "lon": 143.70611, "tz": "Australia/Melbourne"},
-    {"id": "vic-tourello", "name": "Tourello", "lat": -37.35340, "lon": 143.77660, "tz": "Australia/Melbourne"}
+    {"id": "vic-tourello", "name": "Tourello", "lat": -37.35340, "lon": 143.77660, "tz": "Australia/Melbourne"},
 ]
 
 API_URL = "https://api.open-meteo.com/v1/forecast"
-MAX_ATTEMPTS = 4          # tries per region
-PAUSE_BETWEEN_REGIONS = 1.5  # seconds
+TIMEOUT = 60              # seconds to wait for Open-Meteo (was 30)
+BATCH_ATTEMPTS = 6        # tries for the one-call-for-everything request
+SINGLE_ATTEMPTS = 4       # tries per location in the fallback
+PAUSE_BETWEEN_SINGLES = 2 # seconds
+DAILY = "et0_fao_evapotranspiration,precipitation_sum"
 
 
-def fetch_region_week(lat, lon, tz):
-    """Calls Open-Meteo for one location and returns a 7-day list of
-    {date, eto, rain} — the exact shape the calculator expects."""
+def call_api(lats, lons, tz):
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": "et0_fao_evapotranspiration,precipitation_sum",
+        "latitude": ",".join(str(x) for x in lats),
+        "longitude": ",".join(str(x) for x in lons),
+        "daily": DAILY,
         "timezone": tz,
         "forecast_days": 7,
     }
     url = API_URL + "?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=30) as resp:
+    with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
         payload = json.load(resp)
+    # One location returns an object; several return a list (same order).
+    return payload if isinstance(payload, list) else [payload]
 
-    daily = payload["daily"]
+
+def to_week(item):
+    daily = item["daily"]
     dates = daily["time"]
-    eto_vals = daily["et0_fao_evapotranspiration"]
-    rain_vals = daily["precipitation_sum"]
-
-    week = []
-    for i in range(len(dates)):
-        week.append({
-            "date": dates[i],
-            "eto": round(eto_vals[i], 2) if eto_vals[i] is not None else None,
-            "rain": round(rain_vals[i], 2) if rain_vals[i] is not None else None,
-        })
-    # Treat a week with any missing value as a failure so it gets retried.
+    eto = daily["et0_fao_evapotranspiration"]
+    rain = daily["precipitation_sum"]
+    week = [{
+        "date": dates[i],
+        "eto": round(eto[i], 2) if eto[i] is not None else None,
+        "rain": round(rain[i], 2) if rain[i] is not None else None,
+    } for i in range(len(dates))]
+    # A week with any missing value counts as a failure so it gets retried.
     if len(week) < 7 or any(d["eto"] is None or d["rain"] is None for d in week):
         raise ValueError("Open-Meteo returned incomplete data")
     return week
 
 
-def fetch_with_retries(region):
-    last_exc = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+def with_retries(fn, attempts, label):
+    last = None
+    for n in range(1, attempts + 1):
         try:
-            return fetch_region_week(region["lat"], region["lon"], region.get("tz", "Australia/Hobart"))
+            return fn()
         except Exception as exc:
-            last_exc = exc
-            print(f"  attempt {attempt}/{MAX_ATTEMPTS} failed for {region['name']}: {exc}")
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(3 * attempt)  # 3s, 6s, 9s
-    raise last_exc
+            last = exc
+            print(f"  attempt {n}/{attempts} failed for {label}: {exc}")
+            if n < attempts:
+                time.sleep(5 * n)  # 5s, 10s, 15s ...
+    raise last
 
 
 def load_previous():
-    """Returns the regions dict from the existing data.json, or {}."""
     if not os.path.exists("data.json"):
         return {}
     try:
@@ -98,29 +102,61 @@ def load_previous():
 
 
 def main():
-    today_hobart = datetime.now(timezone(timedelta(hours=11))).strftime("%Y-%m-%d")
     previous = load_previous()
-    out = {
-        "generated_date": today_hobart,
-        "regions": {},
-    }
+    regions_out = {}
     failed = []
-    for region in REGIONS:
-        print(f"Fetching {region['name']}...")
-        try:
-            out["regions"][region["id"]] = fetch_with_retries(region)
-        except Exception as exc:
-            print(f"  FAILED for {region['name']} after {MAX_ATTEMPTS} attempts: {exc}")
-            failed.append(region["name"])
-            # Keep yesterday's forecast rather than writing null.
-            out["regions"][region["id"]] = previous.get(region["id"])
-        time.sleep(PAUSE_BETWEEN_REGIONS)
 
+    # Group by timezone so each request has one timezone.
+    groups = {}
+    for r in REGIONS:
+        groups.setdefault(r.get("tz", "Australia/Hobart"), []).append(r)
+
+    for tz, regs in groups.items():
+        print(f"Fetching {len(regs)} locations in one request ({tz})...")
+        batch = None
+        try:
+            batch = with_retries(
+                lambda: call_api([r["lat"] for r in regs], [r["lon"] for r in regs], tz),
+                BATCH_ATTEMPTS, "the batch request")
+            if len(batch) != len(regs):
+                raise ValueError(f"expected {len(regs)} locations, got {len(batch)}")
+        except Exception as exc:
+            print(f"  batch request failed ({exc}); falling back to one request per location")
+            batch = None
+
+        for i, r in enumerate(regs):
+            week = None
+            if batch is not None:
+                try:
+                    week = to_week(batch[i])
+                except Exception as exc:
+                    print(f"  {r['name']}: bad data in batch ({exc})")
+            if week is None:
+                print(f"Fetching {r['name']} on its own...")
+                try:
+                    week = with_retries(
+                        lambda: to_week(call_api([r["lat"]], [r["lon"]], tz)[0]),
+                        SINGLE_ATTEMPTS, r["name"])
+                except Exception as exc:
+                    print(f"  FAILED for {r['name']}: {exc}")
+                    failed.append(r["name"])
+                    week = previous.get(r["id"])  # keep yesterday's, never null-out
+                time.sleep(PAUSE_BETWEEN_SINGLES)
+            regions_out[r["id"]] = week
+
+    first_tz = REGIONS[0].get("tz", "Australia/Hobart")
+    out = {
+        "generated_date": datetime.now(ZoneInfo(first_tz)).strftime("%Y-%m-%d"),
+        "regions": regions_out,
+    }
     with open("data.json", "w") as f:
         json.dump(out, f, indent=2)
     print("Wrote data.json")
+
     if failed:
-        print("WARNING: could not refresh: " + ", ".join(failed))
+        print("ERROR: could not refresh (old forecast kept): " + ", ".join(failed))
+        sys.exit(1)  # makes the GitHub run go RED so it can't fail quietly
+    print("All locations refreshed.")
 
 
 if __name__ == "__main__":
