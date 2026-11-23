@@ -2,7 +2,8 @@ name: Update weather data
 
 on:
   schedule:
-    - cron: "0 20 * * *"
+    - cron: "0 14 * * *"
+    - cron: "0 17 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -24,6 +25,7 @@ jobs:
         run: python3 fetch_weather.py
 
       - name: Commit updated data.json
+        if: always()
         run: |
           git config user.name "weather-bot"
           git config user.email "weather-bot@users.noreply.github.com"
